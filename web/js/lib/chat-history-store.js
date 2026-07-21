@@ -168,6 +168,16 @@ export function mergeHistorySnapshots(...snapshots) {
   };
 }
 
+export function parseHistoryImport(value) {
+  let parsed = value;
+  if (typeof value === "string") parsed = JSON.parse(value);
+  if (Array.isArray(parsed)) parsed = { threads: parsed, meta: {} };
+  if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.threads)) {
+    throw new Error("Not a ComfyUI Agent Panel history export");
+  }
+  return mergeHistorySnapshots(parsed);
+}
+
 function openDb(indexedDb) {
   if (!indexedDb || typeof indexedDb.open !== "function") return Promise.resolve(null);
   return new Promise((resolve) => {
@@ -296,6 +306,22 @@ export class ChatHistoryStore {
   async flush() {
     await this._writePromise.catch(() => null);
     return true;
+  }
+
+  exportPayload(threads, meta = {}) {
+    const snapshot = mergeHistorySnapshots({ threads, meta });
+    return {
+      format: "comfyui-agent-panel-chat-history",
+      schemaVersion: CHAT_HISTORY_SCHEMA,
+      exportedAt: new Date().toISOString(),
+      ...snapshot,
+    };
+  }
+
+  importPayload(value, currentThreads = [], currentMeta = {}, mode = "merge") {
+    const incoming = parseHistoryImport(value);
+    if (mode === "replace") return incoming;
+    return mergeHistorySnapshots({ threads: currentThreads, meta: currentMeta }, incoming);
   }
 
 }

@@ -59,6 +59,8 @@ test('embeds a workflow UUID and blocks a foreign transcript pointer', async ({
   await expect(panel.userBubble('must never restore on this workflow')).toHaveCount(0)
 
   await panel.root.locator('button[title="Chat history"]').click()
+  const currentOnly = panel.root.getByTestId('history-current-workflow')
+  if (await currentOnly.isVisible()) await currentOnly.uncheck()
   const foreign = panel.root.locator('.cmcp-hist-row').filter({ hasText: 'must never restore on this workflow' })
   await expect(foreign).toBeVisible()
   await expect(foreign.locator('.cmcp-hist-open')).toBeDisabled()
