@@ -68,12 +68,12 @@ import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
 import {
   ChatHistoryStore,
+  isThreadInScope,
   mergeHistorySnapshots,
   selectPanelThread,
   selectThreadForScope,
 } from "./lib/chat-history-store.js";
 import {
-  isThreadInScope,
   normalizedWorkflowPath,
   shouldForkEmbeddedWorkflowUuid,
   workflowAliasForPath,
@@ -725,7 +725,7 @@ function persistWorkflowAliases() {
   try {
     window.localStorage.setItem(WORKFLOW_UUID_ALIASES_KEY, JSON.stringify(_workflowUuidAliases));
   } catch {
-    // The embedded UUID remains authoritative when localStorage is unavailable.
+    // IndexedDB history still retains the canonical workflowKey.
   }
 }
 
@@ -783,8 +783,9 @@ function workflowStableUuid(wf = activeWorkflowRef(), { embed = false } = {}) {
   _workflowObjectUuids.set(identityObject, id);
   rememberWorkflowUuidOwner(id, identityObject);
   if (objectUuid && path) {
-    // Rename/Save-As mutates the same live workflow object. Drop stale aliases
-    // so a cold start does not later misclassify the renamed file as a clone.
+    // The same live workflow object moved to a new path (rename/Save-As). Keep
+    // one canonical alias so the next cold start does not see its former path
+    // as evidence that the current file is a clone.
     for (const [knownPath, knownUuid] of Object.entries(_workflowUuidAliases)) {
       if (knownUuid === id && normalizedWorkflowPath(knownPath) !== normalizedWorkflowPath(path)) {
         delete _workflowUuidAliases[knownPath];
@@ -1158,6 +1159,7 @@ const SETTING_MOBILE_BETA = "comfyui-mcp.mobileAppBeta";
 // now operating on. When FALSE, the legacy per-workflow behavior: each workflow
 // keeps its own thread + agent session and switching tabs switches conversations.
 const SETTING_SESSION_FOLLOWS_PANEL = "comfyui-mcp.sessionFollowsPanel";
+const SETTING_CHAT_SCOPE = "comfyui-mcp.chatScope";
 const MOBILE_IOS_TESTFLIGHT_URL = "https://testflight.apple.com/join/ws65s4a2"; // beta-testers external group
 const MOBILE_ANDROID_FIREBASE_URL = "https://appdistribution.firebase.dev/i/27a5cccde72ffb42"; // beta testers group
 const SETTING_EXTERNAL_ORCH = "comfyui-mcp.externalOrchestrator";
@@ -1201,6 +1203,7 @@ const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 // (no-ops when the value already matches) so a setSetting→onChange echo can't loop.
 const panelHooks = {
   applyBackend: null, // (id)
+  applyChatScope: null, // ("panel"|"workflow"|"ask")
   applyModel: null, // (id)
   applyEffort: null, // (id|"")
   applyBridgeUrl: null, // (url)
@@ -1329,9 +1332,12 @@ function getSetting(id) {
     return undefined;
   }
 }
-/** Session ownership mode — panel-owned (default) vs legacy per-workflow. */
-function sessionFollowsPanel() {
-  return getSetting(SETTING_SESSION_FOLLOWS_PANEL) !== false;
+/** Conversation ownership. The legacy boolean remains a read-only migration
+ *  source so existing users keep their chosen behavior. */
+function chatScopeMode() {
+  const mode = getSetting(SETTING_CHAT_SCOPE);
+  if (mode === "panel" || mode === "workflow" || mode === "ask") return mode;
+  return getSetting(SETTING_SESSION_FOLLOWS_PANEL) === false ? "workflow" : "panel";
 }
 function setSetting(id, value) {
   try {
@@ -1718,17 +1724,25 @@ function panelSettingsList() {
       },
     },
     {
-      id: SETTING_SESSION_FOLLOWS_PANEL,
-      name: "Conversation follows the panel (not the workflow)",
-      category: cat("General", "Conversation follows the panel"),
+      id: SETTING_CHAT_SCOPE,
+      name: "Chat conversation scope",
+      category: cat("General", "Chat conversation scope"),
       sortOrder: 146,
       tooltip:
-        "ON (default): your chat and the agent's memory persist while you switch, save, rename, or create " +
-        "workflows — the agent is simply told which canvas it now operates on. " +
-        "OFF: the legacy per-workflow mode — every workflow keeps its own separate conversation and agent " +
-        "session, and switching tabs switches chats.",
-      type: "boolean",
-      defaultValue: true,
+        "Panel: one conversation follows every canvas. Workflow: each saved workflow has its own persistent set of chats, " +
+        "identified by an embedded UUID so renames keep history and copies separate. Ask: choose whether to carry the " +
+        "current conversation whenever you switch workflows. All modes survive full ComfyUI/MCP restarts.",
+      type: "combo",
+      options: [
+        { value: "panel", text: "Panel — one chat across workflows" },
+        { value: "workflow", text: "Workflow — separate chat histories" },
+        { value: "ask", text: "Ask whenever the workflow changes" },
+      ],
+      defaultValue: getSetting(SETTING_SESSION_FOLLOWS_PANEL) === false ? "workflow" : "panel",
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyChatScope?.(v);
+      },
     },
     {
       id: SETTING_AUTOCONNECT,
@@ -7858,6 +7872,9 @@ const PANEL_CSS = `
 .cmcp-iconbtn:disabled { opacity: 0.35; cursor: default; }
 .cmcp-iconbtn.active { color: var(--p-red-400, #f87171); }
 .cmcp-iconbtn .pi { font-size: 0.875rem; }
+.cmcp-workflow-version { margin-top: 0.35rem; font-size: 0.58rem; opacity: 0.62;
+  display: flex; gap: 0.3rem; align-items: center; }
+.cmcp-workflow-version .pi { font-size: 0.58rem; }
 /* ---- sidebar tab badge (these live OUTSIDE .cmcp-root, on the toolbar) ---- */
 /* (.cmcp-tab-logo — the logo-mark tab glyph — is NOT here: it must exist the
    moment registerSidebarTab() paints the toolbar, before the panel ever
@@ -7955,19 +7972,41 @@ const PANEL_CSS = `
 .cmcp-status-btn .pi { color: var(--p-text-muted-color, #a1a1aa); }
 .cmcp-conn-pop { padding: 0.625rem; max-height: none; }
 
-/* History rows: open button + trash, revealed on hover. */
+/* History v2: searchable, workflow-grouped, multi-conversation manager. */
+.cmcp-history-pop { max-height: min(70vh, 34rem); overflow: hidden; padding: 0; }
+.cmcp-hist-tools {
+  position: sticky; top: 0; z-index: 2; display: grid; grid-template-columns: 1fr auto auto;
+  gap: 0.25rem; padding: 0.5rem; background: var(--p-surface-800, #27272a);
+  border-bottom: 1px solid var(--p-content-border-color, #3f3f46);
+}
+.cmcp-hist-search {
+  min-width: 0; border: 1px solid var(--p-form-field-border-color, #52525b);
+  border-radius: var(--p-border-radius-sm, 4px); background: var(--p-form-field-background, #09090b);
+  color: var(--p-form-field-color, #fff); font: inherit; font-size: 0.75rem; padding: 0.35rem 0.45rem;
+}
+.cmcp-hist-filter { grid-column: 1 / -1; display: flex; align-items: center; gap: 0.375rem;
+  color: var(--p-text-muted-color, #a1a1aa); font-size: 0.6875rem; }
+.cmcp-hist-list { max-height: min(58vh, 28rem); overflow-y: auto; padding: 0.25rem; }
+.cmcp-hist-group { padding: 0.35rem 0.5rem 0.2rem; font-size: 0.625rem; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.04em; color: var(--p-text-muted-color, #a1a1aa); }
 .cmcp-hist-row { display: flex; align-items: stretch; gap: 0.125rem; }
+.cmcp-hist-row.active { background: color-mix(in srgb, var(--p-primary-color, #60a5fa) 13%, transparent); border-radius: 4px; }
 .cmcp-hist-row .cmcp-hist-open { flex: 1 1 auto; min-width: 0; }
 .cmcp-hist-row.foreign-workflow { opacity: 0.48; }
 .cmcp-hist-row.foreign-workflow .cmcp-hist-open { cursor: not-allowed; }
-.cmcp-hist-del {
+.cmcp-hist-meta { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.cmcp-hist-meta .lbl { font-weight: 550; }
+.cmcp-hist-sub { color: var(--p-text-muted-color, #a1a1aa); font-size: 0.625rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmcp-hist-action {
   flex: none; width: 1.75rem; border: none; background: transparent; cursor: pointer;
   color: var(--p-text-muted-color, #a1a1aa); border-radius: var(--p-border-radius-sm, 4px);
   opacity: 0; transition: opacity 0.12s, background 0.12s, color 0.12s;
 }
-.cmcp-hist-row:hover .cmcp-hist-del { opacity: 1; }
-.cmcp-hist-del:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-red-400, #f87171); }
-.cmcp-hist-del .pi { font-size: 0.75rem; }
+.cmcp-hist-row:hover .cmcp-hist-action, .cmcp-hist-action.on { opacity: 1; }
+.cmcp-hist-action:hover { background: var(--p-surface-700, #3f3f46); color: var(--p-text-color, #fff); }
+.cmcp-hist-action.danger:hover { color: var(--p-red-400, #f87171); }
+.cmcp-hist-action .pi { font-size: 0.75rem; }
 
 /* Model/effort picker popover (anchored above the composer). */
 .cmcp-pop-section { padding: 0.25rem 0.5rem 0.125rem; font-size: 0.625rem; font-weight: 600;
@@ -8401,6 +8440,7 @@ function buildPanel() {
     b.type = "button";
     b.className = "cmcp-iconbtn";
     b.title = titleText;
+    b.setAttribute("aria-label", titleText);
     const i = document.createElement("i");
     i.className = `pi ${icon}`;
     b.appendChild(i);
@@ -8428,7 +8468,7 @@ function buildPanel() {
 
   header.style.position = "relative";
   const histPop = document.createElement("div");
-  histPop.className = "cmcp-popover cmcp-popover--down";
+  histPop.className = "cmcp-popover cmcp-popover--down cmcp-history-pop";
   histPop.hidden = true;
   header.append(logo, actions, status, histPop);
   root.appendChild(header);
@@ -10039,8 +10079,8 @@ function buildPanel() {
 
   // ---- feed renderers + thread persistence ----
   // paint* draws DOM only; append* paints AND records into the current
-  // thread. IndexedDB is canonical; localStorage remains a small synchronous
-  // startup shadow and migration source for pre-v2 panel builds.
+  // thread. IndexedDB is canonical; localStorage is a small startup/migration
+  // shadow for compatibility with older panel builds.
   const THREADS_KEY = "comfyui-mcp.panel.threads";
   const MAX_THREADS = 500;
   const MAX_THREAD_MSGS = 5000;
@@ -10048,14 +10088,34 @@ function buildPanel() {
   const localHistory = historyStore.readLocal();
   let threads = localHistory.threads;
   let historyMeta = localHistory.meta;
+  let historyHydrated = false;
   let thread = null; // created lazily on first recorded message
+  // In "ask" mode this is chosen at each workflow switch. The initial canvas
+  // behaves as per-workflow until there is actually a switch to ask about.
+  let askModeFollowsPanel = false;
 
-  function currentTranscriptScopeKey({ embed = false } = {}) {
-    return sessionFollowsPanel() ? workflowTabId() : workflowStorageKey({ embed });
+  const unsubscribeHistorySync = historyStore.subscribe((incoming) => {
+    const currentThreadId = thread?.id;
+    const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, incoming);
+    threads = merged.threads.slice(-MAX_THREADS);
+    historyMeta = merged.meta;
+    if (currentThreadId) {
+      const refreshed = threads.find((candidate) => candidate.id === currentThreadId);
+      if (refreshed && (historyScopeFollowsPanel() || isThreadInScope(refreshed, currentHistoryScopeKey()))) {
+        thread = refreshed;
+      }
+      else if (historyMeta.deletedThreads?.[currentThreadId]) newChat();
+    }
+    if (!histPop.hidden) renderHistory();
+  });
+
+  function historyScopeFollowsPanel() {
+    const mode = chatScopeMode();
+    return mode === "panel" || (mode === "ask" && askModeFollowsPanel);
   }
 
-  function currentHistorySelectionKey({ embed = false } = {}) {
-    return sessionFollowsPanel() ? "panel:global" : workflowStorageKey({ embed });
+  function currentHistoryScopeKey({ embed = false } = {}) {
+    return historyScopeFollowsPanel() ? "panel:global" : workflowStorageKey({ embed });
   }
 
   function setActiveThread(scopeKey, threadId) {
@@ -10069,46 +10129,72 @@ function buildPanel() {
     historyStore.persist(threads.slice(-MAX_THREADS), historyMeta);
   }
 
-  const unsubscribeHistorySync = historyStore.subscribe((incoming) => {
-    const currentThreadId = thread?.id;
-    const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, incoming);
-    threads = merged.threads.slice(-MAX_THREADS);
-    historyMeta = merged.meta;
-    if (currentThreadId) {
-      const refreshed = threads.find((candidate) => candidate.id === currentThreadId);
-      if (refreshed && isThreadInScope(refreshed, currentTranscriptScopeKey())) thread = refreshed;
-      else if (historyMeta.deletedThreads?.[currentThreadId]) newChat();
-    }
-    if (!histPop.hidden) renderHistory();
-  });
+  // Multiple conversations may belong to one workflow. The explicitly active
+  // one wins; otherwise use the most recently updated thread. Legacy path-keyed
+  // records are adopted into the UUID key when that workflow is next opened.
+  function threadsForWorkflow(wfid) {
+    return threads
+      .filter((candidate) => candidate.workflowKey === wfid)
+      .sort((a, b) => Number(b.updatedAt || b.ts || 0) - Number(a.updatedAt || a.ts || 0));
+  }
 
-  // Find the (single) thread bound to an exact transcript scope. Old path-keyed
-  // records are adopted only when their path exactly matches the open workflow;
-  // paths never authorize loading after that one-way migration.
   function threadForWorkflow(wfid) {
-    if (wfid.startsWith("workflow:") && !threads.some((candidate) => candidate.workflowKey === wfid)) {
+    let candidates = threadsForWorkflow(wfid);
+    if (!candidates.length && wfid.startsWith("workflow:")) {
       const path = savedWorkflowPath();
       const legacyKey = path ? `wf:${path}` : null;
       const legacy = legacyKey ? threads.filter((candidate) => candidate.workflowKey === legacyKey) : [];
       if (legacy.length) {
         for (const candidate of legacy) candidate.workflowKey = wfid;
+        candidates = threadsForWorkflow(wfid);
         persistThreads();
       }
     }
-    return selectThreadForScope(threads, historyMeta, wfid);
+    return selectThreadForScope(candidates, historyMeta, wfid);
+  }
+
+  function workflowVersionSnapshot() {
+    try {
+      const workflow = app?.graph?.serialize?.();
+      if (!workflow || typeof workflow !== "object") return null;
+      const json = JSON.stringify(workflow);
+      let hash = 0x811c9dc5;
+      for (let i = 0; i < json.length; i++) {
+        hash ^= json.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193);
+      }
+      const version = {
+        hash: (hash >>> 0).toString(16).padStart(8, "0"),
+        capturedAt: Date.now(),
+        nodeCount: Array.isArray(workflow.nodes) ? workflow.nodes.length : 0,
+        workflowKey: workflowStorageKey(),
+        title: getWorkflowTitle(),
+        path: savedWorkflowPath() || undefined,
+      };
+      // Keep restorable snapshots when reasonably small. Large graphs still get
+      // an exact hash + node count without multiplying storage uncontrollably.
+      if (json.length <= 300_000) version.snapshot = workflow;
+      return version;
+    } catch {
+      return null;
+    }
   }
 
   function record(entry) {
-    const perWorkflow = !sessionFollowsPanel();
-    const scopeKey = perWorkflow ? workflowStorageKey({ embed: true }) : workflowTabId();
+    const followsPanel = historyScopeFollowsPanel();
+    // Panel-owned continuity uses a global active-thread pointer, but the thread
+    // keeps the ride-along bridge id as provenance for archive grouping. Strict
+    // UUID scope checks are intentionally exclusive to per-workflow mode.
+    const desiredWorkflowKey = followsPanel ? workflowTabId() : currentHistoryScopeKey({ embed: true });
     // Settings can hydrate after a greeting was painted. Never append a real
     // workflow-scoped message to a thread carrying another scope.
-    if (thread && perWorkflow && !isThreadInScope(thread, scopeKey)) {
+    if (thread && !followsPanel && !isThreadInScope(thread, desiredWorkflowKey)) {
       thread = null;
       ssSet(CURRENT_THREAD_KEY, null);
     }
     if (!thread) {
       const now = Date.now();
+      const workflowKey = desiredWorkflowKey;
       thread = {
         id: crypto.randomUUID(),
         schemaVersion: 2,
@@ -10116,7 +10202,12 @@ function buildPanel() {
         updatedAt: now,
         ts: now,
         msgs: [],
-        workflowKey: scopeKey,
+        workflowKey,
+        workflowTitle: getWorkflowTitle(),
+        provider: connectedBackend || selectedBackend,
+        model: prefs.model || orchestratorCurrentModel || pickDefaultModel(modelCatalog),
+        effort: prefs.effort,
+        workflowVersions: {},
       };
       // Adopt any session id the orchestrator has already reported for this tab.
       const sid = ssGet(SESSION_KEY);
@@ -10124,7 +10215,16 @@ function buildPanel() {
       threads.push(thread);
       if (threads.length > MAX_THREADS) threads = threads.slice(-MAX_THREADS);
       ssSet(CURRENT_THREAD_KEY, thread.id);
-      setActiveThread(currentHistorySelectionKey(), thread.id);
+      setActiveThread(followsPanel ? "panel:global" : workflowKey, thread.id);
+    }
+    if (entry.role === "user") {
+      const version = workflowVersionSnapshot();
+      if (version) {
+        thread.workflowVersions = thread.workflowVersions || {};
+        thread.workflowVersions[version.hash] = version;
+        entry = { ...entry, workflowVersion: version.hash };
+      }
+      if (!thread.title) thread.title = String(entry.text || "New chat").trim().slice(0, 80) || "New chat";
     }
     const now = Date.now();
     entry = {
@@ -10137,7 +10237,10 @@ function buildPanel() {
       thread.msgs.splice(0, thread.msgs.length - MAX_THREAD_MSGS);
     }
     thread.updatedAt = now;
-    thread.ts = now;
+    thread.ts = thread.updatedAt;
+    thread.provider = connectedBackend || selectedBackend;
+    thread.model = prefs.model || orchestratorCurrentModel || pickDefaultModel(modelCatalog);
+    thread.effort = prefs.effort;
     persistThreads();
     return entry;
   }
@@ -10206,6 +10309,21 @@ function buildPanel() {
     const b = document.createElement("div");
     b.className = "cmcp-bubble user";
     renderUserText(b, text, opts.attachments);
+    if (opts.workflowVersion) {
+      const version = thread?.workflowVersions?.[opts.workflowVersion];
+      const badge = document.createElement("span");
+      badge.className = "cmcp-workflow-version";
+      badge.title = version?.path || version?.title || "Workflow snapshot";
+      badge.innerHTML = '<i class="pi pi-sitemap"></i>';
+      badge.appendChild(
+        document.createTextNode(
+          version
+            ? `${version.nodeCount} nodes · ${version.hash}`
+            : `workflow · ${opts.workflowVersion}`,
+        ),
+      );
+      b.appendChild(badge);
+    }
     if (opts.mid) b.dataset.mid = opts.mid;
     // Hover edit/rollback button — only on live messages (those with a mid).
     // Absolute-positioned to the LEFT of the bubble so it never causes reflow.
@@ -10660,18 +10778,18 @@ function buildPanel() {
     // this message forks the conversation right before it — stored directly (not as
     // an index, which a bounded-ring shift() would invalidate).
     const rewindAnchor = turnAnchors.length > 0 ? turnAnchors[turnAnchors.length - 1] : null;
-    const painted = paintUser(text, { ...opts, rewindAnchor });
     // Tag the record with its mid so deleteMsg can remove the EXACT message even
     // when several are queued (popping the trailing one would hit the wrong one).
     // Persist any pasted-text attachments ({id, content[, truncated]}) so reload
     // can re-render the bubble chips. `text` stays raw (tokens) for agent/rollback.
     const atts = Array.isArray(opts.attachments) ? opts.attachments : null;
-    record({
+    const recorded = record({
       role: "user",
       text,
       ...(opts.mid ? { mid: opts.mid } : {}),
       ...(atts && atts.length ? { attachments: atts } : {}),
     });
+    const painted = paintUser(text, { ...opts, rewindAnchor, workflowVersion: recorded.workflowVersion });
     return painted;
   }
 
@@ -11082,8 +11200,8 @@ function buildPanel() {
     log.appendChild(empty);
   }
 
-  function newChat() {
-    setActiveThread(currentHistorySelectionKey(), null);
+  function newChat({ notifyBackend = true } = {}) {
+    setActiveThread(currentHistoryScopeKey(), null);
     thread = null;
     turnAnchors = []; // fresh conversation → no rewind anchors
     ssSet(CURRENT_THREAD_KEY, null);
@@ -11093,25 +11211,29 @@ function buildPanel() {
     resetFeed();
     renderTodo([]); // fresh chat → empty plan tray
     setContextPct(0);
-    persistThreads();
     ctxLabel.textContent = "—";
+    persistThreads();
     // Tell the orchestrator to forget this tab's session so the NEXT message
     // starts a genuinely fresh agent (no memory of the prior conversation).
-    client?.sendFrame?.({ type: "new_session" });
+    if (notifyBackend) client?.sendFrame?.({ type: "new_session" });
   }
 
   function loadThread(t) {
-    if (!sessionFollowsPanel() && !isThreadInScope(t, workflowStorageKey())) {
-      appendSystem("Blocked a chat from another workflow. Open its owning workflow before resuming it.");
+    const followsPanel = historyScopeFollowsPanel();
+    const scopeKey = currentHistoryScopeKey();
+    if (!followsPanel && !isThreadInScope(t, scopeKey)) {
+      appendSystem(
+        `Blocked a chat from another workflow. Open "${t?.workflowTitle || "that workflow"}" before resuming it.`,
+      );
       return false;
     }
     thread = t;
     ssSet(CURRENT_THREAD_KEY, t.id);
-    setActiveThread(currentHistorySelectionKey(), t.id);
+    setActiveThread(followsPanel ? "panel:global" : (t.workflowKey || scopeKey), t.id);
     persistThreads();
     resetFeed();
     for (const m of t.msgs) {
-      if (m.role === "user") paintUser(m.text, { attachments: m.attachments });
+      if (m.role === "user") paintUser(m.text, { attachments: m.attachments, workflowVersion: m.workflowVersion });
       else if (m.role === "agent") paintAgent(m.text);
       else if (m.role === "card") {
         if (m.kind === "a2ui") paintA2UIRecord(m);
@@ -11123,7 +11245,14 @@ function buildPanel() {
     // so typing continues THIS chat rather than whatever was last active.
     ssSet(SESSION_KEY, t.sessionId || null);
     if (t.sessionId) client?.sendFrame?.({ type: "resume_session", session_id: t.sessionId });
-    else client?.sendFrame?.({ type: "new_session" });
+    else {
+      client?.sendFrame?.({ type: "new_session" });
+      // Provider sessions can expire or be intentionally removed. A new backend
+      // session receives a compact replay once, so continuing an archived chat
+      // still has useful memory instead of only repainting bubbles locally.
+      const replay = buildReplayTranscript();
+      if (replay) client?.armContext?.(replay);
+    }
     return true;
   }
 
@@ -11150,6 +11279,16 @@ function buildPanel() {
     const wfkey = wf ? (wf.key || wf.id || "unsaved") : null;
     if (wfid === currentWorkflowId) return; // case 1: no change
 
+    const initial = currentWorkflowId == null;
+    if (!initial && chatScopeMode() === "ask") {
+      const name = wf?.filename || wfkey || wfid;
+      askModeFollowsPanel = window.confirm(
+        `Continue the current Agent Panel conversation on "${name}"?\n\n` +
+          "OK: carry this chat to the new canvas.\nCancel: open this workflow's separate chat history.",
+      );
+    }
+    const followsPanel = historyScopeFollowsPanel();
+
     // PANEL-OWNED SESSION (default): the conversation is the unit of continuity
     // and the workflow is just the canvas target — switching, saving, renaming,
     // or creating workflows must never swap or reset the chat (field report:
@@ -11160,12 +11299,12 @@ function buildPanel() {
     // resume_session frame (manager.reset would respawn the agent and wipe
     // in-memory backends like Ollama). The agent learns which canvas it now
     // drives via a one-shot context on the next message.
-    if (sessionFollowsPanel()) {
-      const initial = currentWorkflowId == null;
+    if (followsPanel) {
       // tmp→wf adopt bookkeeping (a save gave the unsaved workflow a real id).
       if (wfid.startsWith("wf:") && wf && (wf.key || wf.id)) _tempWorkflowIds.delete(wf.key || wf.id);
       if (thread) {
         thread.workflowKey = wfid; // thread rides along for archive provenance
+        thread.workflowTitle = getWorkflowTitle();
         thread.updatedAt = Date.now();
         thread.ts = thread.updatedAt;
         setActiveThread("panel:global", thread.id);
@@ -11224,6 +11363,7 @@ function buildPanel() {
       wfid.startsWith("wf:");
     if (renaming) {
       const t = threadForWorkflow(historyKey);
+      if (t) persistThreads(); // alias + embedded UUID keep the history identity stable
       currentWorkflowId = wfid;
       currentWorkflowKey = wfkey;
       currentWorkflowRef = wf;
@@ -11266,38 +11406,130 @@ function buildPanel() {
 
   function renderHistory() {
     histPop.textContent = "";
-    const list = [...threads].reverse();
-    if (!list.length) {
-      const none = document.createElement("div");
-      none.className = "cmcp-sys";
-      none.style.padding = "0.375rem";
-      none.textContent = "No past chats yet.";
-      histPop.appendChild(none);
-      return;
+    const tools = document.createElement("div");
+    tools.className = "cmcp-hist-tools";
+    const search = document.createElement("input");
+    search.type = "search";
+    search.className = "cmcp-hist-search";
+    search.placeholder = "Search chats…";
+    search.setAttribute("aria-label", "Search chat history");
+    search.dataset.testid = "history-search";
+    const exportBtn = iconBtn("pi-download", "Export all chat history");
+    exportBtn.dataset.testid = "history-export";
+    const importBtn = iconBtn("pi-upload", "Import chat history (merge)");
+    importBtn.dataset.testid = "history-import";
+    const currentOnlyLabel = document.createElement("label");
+    currentOnlyLabel.className = "cmcp-hist-filter";
+    const currentOnly = document.createElement("input");
+    currentOnly.type = "checkbox";
+    currentOnly.checked = !historyScopeFollowsPanel();
+    currentOnly.dataset.testid = "history-current-workflow";
+    currentOnlyLabel.append(currentOnly, document.createTextNode("Current workflow only"));
+    tools.append(search, exportBtn, importBtn, currentOnlyLabel);
+
+    const listEl = document.createElement("div");
+    listEl.className = "cmcp-hist-list";
+    histPop.append(tools, listEl);
+
+    function friendlyWorkflowName(t) {
+      if (t.workflowKey === "panel:global") return "Panel-wide conversations";
+      return t.workflowTitle || t.workflowKey?.replace(/^workflow:|^wf:/, "") || "Unknown workflow";
     }
-    for (const t of list) {
+
+    function rowAction(icon, titleText, onClick, extraClass = "") {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `cmcp-hist-action ${extraClass}`.trim();
+      button.title = titleText;
+      button.setAttribute("aria-label", titleText);
+      const glyph = document.createElement("i");
+      glyph.className = `pi ${icon}`;
+      button.appendChild(glyph);
+      button.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        onClick();
+      });
+      return button;
+    }
+
+    function paintList() {
+      listEl.textContent = "";
+      const q = search.value.trim().toLocaleLowerCase();
+      const scopeKey = currentHistoryScopeKey();
+      const visible = threads
+        .filter((candidate) => !currentOnly.checked || candidate.workflowKey === scopeKey)
+        .filter((candidate) => {
+          if (!q) return true;
+          const haystack = [
+            candidate.title,
+            candidate.workflowTitle,
+            candidate.provider,
+            candidate.model,
+            ...(candidate.msgs || []).map((m) => m.text),
+          ].filter(Boolean).join("\n").toLocaleLowerCase();
+          return haystack.includes(q);
+        })
+        .sort((a, b) => Number(b.pinned) - Number(a.pinned) || Number(b.updatedAt || b.ts) - Number(a.updatedAt || a.ts));
+      if (!visible.length) {
+        const none = document.createElement("div");
+        none.className = "cmcp-sys";
+        none.style.padding = "0.75rem";
+        none.textContent = q ? "No chats match this search." : "No past chats in this scope yet.";
+        listEl.appendChild(none);
+        return;
+      }
+      const groups = new Map();
+      for (const candidate of visible) {
+        const group = friendlyWorkflowName(candidate);
+        if (!groups.has(group)) groups.set(group, []);
+        groups.get(group).push(candidate);
+      }
+      for (const [group, groupThreads] of groups) {
+        const heading = document.createElement("div");
+        heading.className = "cmcp-hist-group";
+        heading.textContent = group;
+        listEl.appendChild(heading);
+        for (const t of groupThreads) paintHistoryRow(t, listEl);
+      }
+    }
+
+    function paintHistoryRow(t, parent) {
       const row = document.createElement("div");
       row.className = "cmcp-hist-row";
+      if (thread?.id === t.id) row.classList.add("active");
+      row.dataset.threadId = t.id;
 
       const item = document.createElement("button");
       item.type = "button";
       item.className = "cmcp-popover-item cmcp-hist-open";
       const i = document.createElement("i");
-      i.className = "pi pi-comment";
+      i.className = `pi ${t.pinned ? "pi-bookmark-fill" : "pi-comment"}`;
+      const meta = document.createElement("span");
+      meta.className = "cmcp-hist-meta";
       const lbl = document.createElement("span");
       lbl.className = "lbl";
       const firstUser = t.msgs.find((m) => m.role === "user");
-      lbl.textContent = (firstUser?.text ?? "(no messages)").slice(0, 48);
+      lbl.textContent = (t.title || firstUser?.text || "(no messages)").slice(0, 80);
+      const sub = document.createElement("span");
+      sub.className = "cmcp-hist-sub";
+      const latestVersion = Object.values(t.workflowVersions || {}).sort(
+        (a, b) => Number(b.capturedAt || 0) - Number(a.capturedAt || 0),
+      )[0];
+      sub.textContent = [t.provider, t.model, latestVersion ? `${latestVersion.nodeCount} nodes · ${latestVersion.hash}` : null]
+        .filter(Boolean)
+        .join(" · ");
+      meta.append(lbl, sub);
       const when = document.createElement("small");
-      when.textContent = new Date(t.ts).toLocaleDateString(undefined, {
+      when.textContent = new Date(t.updatedAt || t.ts).toLocaleDateString(undefined, {
         month: "short",
         day: "numeric",
       });
-      item.append(i, lbl, when);
-      const foreignWorkflow = !sessionFollowsPanel() && !isThreadInScope(t, currentTranscriptScopeKey());
+      item.append(i, meta, when);
+      const foreignWorkflow = !historyScopeFollowsPanel() && !isThreadInScope(t, currentHistoryScopeKey());
       if (foreignWorkflow) {
         item.disabled = true;
-        item.title = "Open this chat's workflow before resuming it";
+        item.title = `Open ${friendlyWorkflowName(t)} before resuming this chat`;
+        item.setAttribute("aria-label", `${lbl.textContent} — open that workflow before resuming`);
         row.classList.add("foreign-workflow");
       }
       item.addEventListener("click", () => {
@@ -11306,15 +11538,22 @@ function buildPanel() {
         loadThread(t);
       });
 
-      const del = document.createElement("button");
-      del.type = "button";
-      del.className = "cmcp-hist-del";
-      del.title = "Delete this chat";
-      const di = document.createElement("i");
-      di.className = "pi pi-trash";
-      del.appendChild(di);
-      del.addEventListener("click", (ev) => {
-        ev.stopPropagation();
+      const pin = rowAction(t.pinned ? "pi-bookmark-fill" : "pi-bookmark", t.pinned ? "Unpin chat" : "Pin chat", () => {
+        t.pinned = !t.pinned;
+        t.updatedAt = Date.now();
+        persistThreads();
+        paintList();
+      }, t.pinned ? "on" : "");
+      const rename = rowAction("pi-pencil", "Rename chat", () => {
+        const next = window.prompt("Chat title", t.title || firstUser?.text || "New chat");
+        if (next == null) return;
+        t.title = next.trim().slice(0, 160) || undefined;
+        t.updatedAt = Date.now();
+        persistThreads();
+        paintList();
+      });
+      const del = rowAction("pi-trash", "Delete this chat", () => {
+        if (!window.confirm(`Delete chat "${t.title || firstUser?.text || "New chat"}"?`)) return;
         historyMeta.deletedThreads = historyMeta.deletedThreads || {};
         historyMeta.deletedThreads[t.id] = Date.now();
         threads = threads.filter((x) => x.id !== t.id);
@@ -11324,12 +11563,48 @@ function buildPanel() {
         persistThreads();
         // Deleting the open chat clears the feed and starts fresh.
         if (thread && thread.id === t.id) newChat();
-        renderHistory();
-      });
+        paintList();
+      }, "danger");
 
-      row.append(item, del);
-      histPop.appendChild(row);
+      row.append(item, pin, rename, del);
+      parent.appendChild(row);
     }
+
+    search.addEventListener("input", paintList);
+    currentOnly.addEventListener("change", paintList);
+    exportBtn.addEventListener("click", () => {
+      const payload = historyStore.exportPayload(threads, historyMeta);
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `comfyui-agent-panel-history-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+    importBtn.addEventListener("click", () => {
+      const picker = document.createElement("input");
+      picker.type = "file";
+      picker.accept = "application/json,.json";
+      picker.addEventListener("change", async () => {
+        const file = picker.files?.[0];
+        if (!file) return;
+        try {
+          const imported = historyStore.importPayload(await file.text(), threads, historyMeta, "merge");
+          threads = imported.threads.slice(-MAX_THREADS);
+          historyMeta = imported.meta;
+          persistThreads();
+          paintList();
+          appendSystem(`Imported ${imported.threads.length} chat(s); existing history was preserved.`);
+        } catch (error) {
+          appendSystem(`History import failed: ${error?.message || error}`);
+        }
+      }, { once: true });
+      picker.click();
+    });
+    paintList();
   }
 
   newChatBtn.addEventListener("click", () => {
@@ -14519,42 +14794,27 @@ function buildPanel() {
   // memory continues automatically — either the orchestrator's agent for this
   // (stable) tab id is still alive, or hello's `resume` (the session id kept in
   // sessionStorage) rehydrates it from disk after an orchestrator restart.
-  (function restoreLastThread() {
+  function restoreLastThread() {
     try {
       const cur = ssGet(CURRENT_THREAD_KEY);
       const pointed = cur ? threads.find((x) => x.id === cur) : null;
-      if (sessionFollowsPanel()) {
-        // Recover from a lost tab pointer using durable metadata/newest fallback.
-        // Settings may not be hydrated yet, so never rewrite the thread's key.
-        const panelThread = pointed || selectPanelThread(threads, historyMeta);
-        if (!panelThread || !panelThread.msgs?.length) return;
-        thread = panelThread;
-        ssSet(CURRENT_THREAD_KEY, panelThread.id);
-        ssSet(SESSION_KEY, panelThread.sessionId || null);
-        setActiveThread("panel:global", panelThread.id);
-        resetFeed();
-        for (const m of panelThread.msgs) {
-          if (m.role === "user") paintUser(m.text, { attachments: m.attachments });
-          else if (m.role === "agent") paintAgent(m.text);
-          else if (m.role === "card") {
-            if (m.kind === "a2ui") paintA2UIRecord(m);
-            else paintCard(m);
-          }
-        }
-        renderTodo(panelThread.todos || []);
-        return;
-      }
-      const scopeKey = workflowStorageKey();
-      const scopedPointed = pointed && isThreadInScope(pointed, scopeKey) ? pointed : null;
-      const t = scopedPointed || threadForWorkflow(scopeKey);
+      const followsPanel = historyScopeFollowsPanel();
+      const scopeKey = followsPanel ? null : workflowStorageKey();
+      const scopedPointed = pointed && (followsPanel || isThreadInScope(pointed, scopeKey)) ? pointed : null;
+      const workflowBound = followsPanel ? null : threadForWorkflow(scopeKey);
+      // This function can run before settings hydrate. Panel mode therefore
+      // restores a record exactly as stored and never rewrites its workflow key.
+      const t = followsPanel
+        ? (scopedPointed || selectPanelThread(threads, historyMeta))
+        : (scopedPointed || workflowBound);
       if (!t || !t.msgs?.length) return;
+      if (followsPanel) setActiveThread("panel:global", t.id);
       thread = t;
       ssSet(CURRENT_THREAD_KEY, t.id);
       ssSet(SESSION_KEY, t.sessionId || null);
-      setActiveThread(t.workflowKey, t.id);
       resetFeed();
       for (const m of t.msgs) {
-        if (m.role === "user") paintUser(m.text, { attachments: m.attachments });
+        if (m.role === "user") paintUser(m.text, { attachments: m.attachments, workflowVersion: m.workflowVersion });
         else if (m.role === "agent") paintAgent(m.text);
         else if (m.role === "card") {
           if (m.kind === "a2ui") paintA2UIRecord(m);
@@ -14565,10 +14825,11 @@ function buildPanel() {
     } catch {
       // Corrupt/absent state — start clean.
     }
-  })();
+  }
+  restoreLastThread();
 
   // Paint the localStorage shadow immediately, then hydrate the canonical
-  // IndexedDB snapshot in the background and promote any legacy records.
+  // IndexedDB snapshot in the background.
   void historyStore.load().then((loaded) => {
     const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, loaded);
     threads = merged.threads.slice(-MAX_THREADS);
@@ -14577,13 +14838,17 @@ function buildPanel() {
       _workflowUuidAliases = { ...historyMeta.workflowAliases, ..._workflowUuidAliases };
       persistWorkflowAliases();
     }
+    historyHydrated = true;
     persistThreads();
-    const durableActive = sessionFollowsPanel()
+    const followsPanel = historyScopeFollowsPanel();
+    const hydratedScopeKey = followsPanel ? "panel:global" : workflowStorageKey();
+    const durableActive = followsPanel
       ? selectPanelThread(threads, historyMeta)
-      : threadForWorkflow(currentTranscriptScopeKey());
+      : threadForWorkflow(hydratedScopeKey);
     if (durableActive && durableActive.id !== thread?.id) loadThread(durableActive);
+    else if (!thread || !thread.msgs?.length) restoreLastThread();
   }).catch(() => {
-    // localStorage shadow already painted; persistence degrades gracefully.
+    historyHydrated = true;
   });
 
   // ---- Settings dialog → live panel hooks ----
@@ -14599,6 +14864,33 @@ function buildPanel() {
     // provider row) — exactly ONE connect, and the single post-handshake catalog
     // push carries the new backend's values. No set_options is sent here.
     connectBackend(id);
+  };
+  panelHooks.applyChatScope = (mode) => {
+    if (!['panel', 'workflow', 'ask'].includes(mode)) return;
+    askModeFollowsPanel = mode === "panel";
+    const targetKey = mode === "panel" ? "panel:global" : workflowStorageKey();
+    const panelTargetId = mode === "panel" ? historyMeta.activeByScope?.[targetKey] : null;
+    let target = mode === "panel"
+      ? threads.find((candidate) => candidate.id === panelTargetId)
+      : threadForWorkflow(targetKey);
+    if (!target && mode === "panel" && thread) {
+      // First switch to panel-owned mode: carry the visible conversation into
+      // the global selection slot without discarding its workflow provenance.
+      target = thread;
+      setActiveThread(targetKey, target.id);
+      persistThreads();
+    }
+    if (target) loadThread(target);
+    else newChat({ notifyBackend: false });
+    currentWorkflowId = null;
+    onWorkflowMaybeChanged();
+    appendSystem(
+      mode === "panel"
+        ? "Chat scope → panel-wide conversation."
+        : mode === "workflow"
+          ? "Chat scope → separate histories for each workflow."
+          : "Chat scope → ask whenever the workflow changes.",
+    );
   };
   panelHooks.applyModel = (id) => {
     const next = (id || "").trim();
@@ -14753,6 +15045,7 @@ function buildPanel() {
       // Drop the Settings→panel hooks so the dialog can't drive a torn-down panel
       // (a freshly-mounted panel re-registers them).
       panelHooks.applyBackend = null;
+      panelHooks.applyChatScope = null;
       panelHooks.applyModel = null;
       panelHooks.applyEffort = null;
       panelHooks.applyBridgeUrl = null;

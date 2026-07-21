@@ -83,8 +83,9 @@ test('default mode opens pre-upgrade history without re-keying it', async ({
   page,
   panel
 }) => {
-  await panel.goto()
-  await page.evaluate(({ threadsKey, currentThreadKey }) => {
+  // Seed storage before navigation: ComfyUI may eagerly restore the Agent tab
+  // and mount the panel before openSidebar() is called.
+  await page.addInitScript(({ threadsKey, currentThreadKey }) => {
     localStorage.setItem(threadsKey, JSON.stringify([
       {
         id: 'old-current',
@@ -101,6 +102,7 @@ test('default mode opens pre-upgrade history without re-keying it', async ({
     ]))
     sessionStorage.setItem(currentThreadKey, 'old-current')
   }, { threadsKey: THREADS_KEY, currentThreadKey: CURRENT_THREAD_KEY })
+  await panel.goto()
 
   await panel.openSidebar()
   await expect(panel.userBubble('old current thread')).toBeVisible()
@@ -132,8 +134,8 @@ test('settings hydration cannot rewrite a workflow thread or clear the live sess
     const originalGet = settings.getSettingValue.bind(settings)
     w.__cmcpPerWorkflowHydrated = false
     settings.getSettingValue = (id: string) =>
-      id === 'comfyui-mcp.sessionFollowsPanel'
-        ? !w.__cmcpPerWorkflowHydrated
+      id === 'comfyui-mcp.chatScope'
+        ? (w.__cmcpPerWorkflowHydrated ? 'workflow' : 'panel')
         : originalGet(id)
     localStorage.setItem(threadsKey, JSON.stringify([{
       id: 'workflow-before-hydration',
@@ -225,6 +227,8 @@ test('embeds a workflow UUID and blocks a foreign transcript pointer', async ({
   await expect(panel.userBubble('must never restore on this workflow')).toHaveCount(0)
 
   await panel.root.locator('button[title="Chat history"]').click()
+  const currentOnly = panel.root.getByTestId('history-current-workflow')
+  if (await currentOnly.isVisible()) await currentOnly.uncheck()
   const foreign = panel.root.locator('.cmcp-hist-row').filter({ hasText: 'must never restore on this workflow' })
   await expect(foreign).toBeVisible()
   await expect(foreign.locator('.cmcp-hist-open')).toBeDisabled()

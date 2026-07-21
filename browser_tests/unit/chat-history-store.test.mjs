@@ -8,6 +8,7 @@ import {
   mergeHistorySnapshots,
   normalizeThread,
   selectPanelThread,
+  parseHistoryImport,
   selectThreadForScope
 } from '../../web/js/lib/chat-history-store.js'
 
@@ -35,6 +36,12 @@ test('merges browser and durable snapshots by newest thread update', () => {
   assert.equal(merged.threads[0].title, 'kept title')
   assert.equal(merged.meta.activeByScope['panel:global'], 'same')
   assert.equal(merged.meta.workflowAliases['workflows/a.json'], 'uuid-a')
+})
+
+test('accepts legacy array exports and rejects unrelated JSON', () => {
+  const imported = parseHistoryImport(JSON.stringify([{ id: 'one', ts: 1, msgs: [] }]))
+  assert.equal(imported.threads[0].id, 'one')
+  assert.throws(() => parseHistoryImport('{"hello":"world"}'), /not a ComfyUI Agent Panel/i)
 })
 
 test('merges concurrent messages in the same thread without dropping either tab', () => {

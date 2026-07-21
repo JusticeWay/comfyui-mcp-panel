@@ -37,6 +37,13 @@ All notable changes to this project are documented here. This project adheres to
   Luna tops out at `max`); pairs with comfyui-mcp >= 0.41.0
 
 ### Added
+- **Chat History v2** — multiple named/pinned conversations per workflow;
+  workflow UUIDs embedded in graph metadata (rename-safe, clone-aware); a
+  searchable workflow-grouped history manager with JSON import/export;
+  provider/model/session metadata and per-user-message graph hash/snapshot;
+  IndexedDB durability with automatic migration from the legacy 20-thread
+  localStorage ring. The conversation scope is now an explicit Panel / Workflow /
+  Ask setting. Missing provider sessions continue from a compact transcript replay.
 - max + ultra on the Codex scale for GPT-5.6 (#94)
 
 
@@ -179,7 +186,7 @@ All notable changes to this project are documented here. This project adheres to
   mechanically told which canvas it operates on (one-shot context, no memory
   tools). The live agent instance is rebound across tab ids (no respawn), so
   even in-memory local backends keep their history. Settings → General →
-  "Conversation follows the panel" restores the legacy per-workflow mode
+  "Chat conversation scope" also offers per-workflow and ask-on-switch modes
 
 ### Changed
 - the agent-feed gate is now **Deafen** (was Mute), with ear / slashed-ear icons —
