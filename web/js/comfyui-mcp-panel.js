@@ -722,7 +722,7 @@ function persistWorkflowAliases() {
   try {
     window.localStorage.setItem(WORKFLOW_UUID_ALIASES_KEY, JSON.stringify(_workflowUuidAliases));
   } catch {
-    // IndexedDB history still retains the canonical workflowKey.
+    // IndexedDB/server history still retain the canonical workflowKey.
   }
 }
 
@@ -1132,6 +1132,7 @@ const SETTING_MOBILE_BETA = "comfyui-mcp.mobileAppBeta";
 // keeps its own thread + agent session and switching tabs switches conversations.
 const SETTING_SESSION_FOLLOWS_PANEL = "comfyui-mcp.sessionFollowsPanel";
 const SETTING_CHAT_SCOPE = "comfyui-mcp.chatScope";
+const SETTING_HISTORY_SERVER_BACKUP = "comfyui-mcp.chatHistoryServerBackup";
 const MOBILE_IOS_TESTFLIGHT_URL = "https://testflight.apple.com/join/ws65s4a2"; // beta-testers external group
 const MOBILE_ANDROID_FIREBASE_URL = "https://appdistribution.firebase.dev/i/27a5cccde72ffb42"; // beta testers group
 const SETTING_EXTERNAL_ORCH = "comfyui-mcp.externalOrchestrator";
@@ -1176,6 +1177,7 @@ const SECRET_SET_AT_PREFIX = "comfyui-mcp.panel.secretSetAt.";
 const panelHooks = {
   applyBackend: null, // (id)
   applyChatScope: null, // ("panel"|"workflow"|"ask")
+  applyHistoryServerBackup: null, // (bool)
   applyModel: null, // (id)
   applyEffort: null, // (id|"")
   applyBridgeUrl: null, // (url)
@@ -1713,6 +1715,22 @@ function panelSettingsList() {
       onChange: (v) => {
         if (suppressSettingOnChange || !settingsArmed) return;
         panelHooks.applyChatScope?.(v);
+      },
+    },
+    {
+      id: SETTING_HISTORY_SERVER_BACKUP,
+      name: "Back up chat history on this ComfyUI server",
+      category: cat("General", "Chat history server backup"),
+      sortOrder: 145.5,
+      tooltip:
+        "Optional. Keeps a versioned JSON backup under ComfyUI's user directory so history can survive browser-data " +
+        "cleanup and be reused by another browser connected to this same ComfyUI instance. Chat text and persisted " +
+        "attachment content are stored locally on that server; provider credentials are never included.",
+      type: "boolean",
+      defaultValue: false,
+      onChange: (v) => {
+        if (suppressSettingOnChange || !settingsArmed) return;
+        panelHooks.applyHistoryServerBackup?.(!!v);
       },
     },
     {
@@ -10031,11 +10049,14 @@ function buildPanel() {
   // ---- feed renderers + thread persistence ----
   // paint* draws DOM only; append* paints AND records into the current
   // thread. IndexedDB is canonical; localStorage is a small startup/migration
-  // shadow for compatibility with older panel builds.
+  // shadow, and an optional server backup can be enabled in Settings.
   const THREADS_KEY = "comfyui-mcp.panel.threads";
   const MAX_THREADS = 500;
   const MAX_THREAD_MSGS = 5000;
-  const historyStore = new ChatHistoryStore({ threadsKey: THREADS_KEY });
+  const historyStore = new ChatHistoryStore({
+    threadsKey: THREADS_KEY,
+    serverEnabled: () => getSetting(SETTING_HISTORY_SERVER_BACKUP) === true,
+  });
   const localHistory = historyStore.readLocal();
   let threads = localHistory.threads;
   let historyMeta = localHistory.meta;
@@ -14788,7 +14809,7 @@ function buildPanel() {
   restoreLastThread();
 
   // Paint the localStorage shadow immediately, then hydrate the canonical
-  // IndexedDB snapshot in the background.
+  // IndexedDB snapshot and optional same-origin server backup in the background.
   void historyStore.load().then((loaded) => {
     const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, loaded);
     threads = merged.threads.slice(-MAX_THREADS);
@@ -14846,6 +14867,21 @@ function buildPanel() {
           ? "Chat scope → separate histories for each workflow."
           : "Chat scope → ask whenever the workflow changes.",
     );
+  };
+  panelHooks.applyHistoryServerBackup = async (on) => {
+    if (!on) {
+      appendSystem("Server chat-history backup disabled; the existing backup was left intact.");
+      return;
+    }
+    const remote = await historyStore.readServer();
+    if (remote) {
+      const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, remote);
+      threads = merged.threads.slice(-MAX_THREADS);
+      historyMeta = merged.meta;
+    }
+    persistThreads();
+    await historyStore.writeServer(historyStore.exportPayload(threads, historyMeta));
+    appendSystem("Chat history is now backed up on this ComfyUI server.");
   };
   panelHooks.applyModel = (id) => {
     const next = (id || "").trim();
@@ -15001,6 +15037,7 @@ function buildPanel() {
       // (a freshly-mounted panel re-registers them).
       panelHooks.applyBackend = null;
       panelHooks.applyChatScope = null;
+      panelHooks.applyHistoryServerBackup = null;
       panelHooks.applyModel = null;
       panelHooks.applyEffort = null;
       panelHooks.applyBridgeUrl = null;

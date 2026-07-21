@@ -50,7 +50,7 @@ Each provider runs its own orchestrator on its own loopback port (Claude on
 | **Autonomous install → restart → continue** | Install custom nodes through your own ComfyUI Manager, restart ComfyUI to load them, and the panel auto-reconnects so the agent resumes its task. |
 | **Reasoning effort + model selector** | A per-provider effort/model picker — Claude's models, or ChatGPT's GPT-5-class models via Codex — moved into the model selector; a chosen effort survives a provider switch by mapping to the nearest valid level. |
 | **Pending-message tray + reconnect durability** | Queue messages while the agent is busy (edit / send-now / reorder), and reclaim a wedged orchestrator on Connect. |
-| **Durable workflow chat history** | Keep multiple named or pinned chats per workflow, search across them, export/import JSON, survive browser-data loss through IndexedDB, and track the graph version used by every user turn. |
+| **Durable workflow chat history** | Keep multiple named or pinned chats per workflow, search across them, export/import JSON, survive browser-data loss through IndexedDB or an optional ComfyUI-side backup, and track the graph version used by every user turn. |
 
 ## Quickstart
 
