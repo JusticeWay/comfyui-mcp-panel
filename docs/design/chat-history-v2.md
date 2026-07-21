@@ -34,6 +34,11 @@ kept for instant paint and compatibility with older panel builds. On startup the
 panel merges legacy and IndexedDB snapshots by thread ID and timestamp, then
 writes the migrated schema back automatically.
 
+Optional server backup uses `GET/PUT /comfyui_mcp_panel/chat_history`. It stores
+one atomic, maximum-25-MB JSON file under
+`<ComfyUI user directory>/comfyui-mcp-panel/chat-history.json`. It is disabled by
+default because transcripts and persisted attachment content are private data.
+
 ## Continuity and graph versions
 
 Each thread records its provider, model, effort, session ID, active workflow,
