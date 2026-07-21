@@ -42,8 +42,9 @@ All notable changes to this project are documented here. This project adheres to
   searchable workflow-grouped history manager with JSON import/export;
   provider/model/session metadata and per-user-message graph hash/snapshot;
   IndexedDB durability with automatic migration from the legacy 20-thread
-  localStorage ring. The conversation scope is now an explicit Panel / Workflow /
-  Ask setting. Missing provider sessions continue from a compact transcript replay.
+  localStorage ring; and an opt-in, size-bounded backup under the ComfyUI user
+  directory. The conversation scope is now an explicit Panel / Workflow / Ask
+  setting. Missing provider sessions continue from a compact transcript replay.
 - max + ultra on the Codex scale for GPT-5.6 (#94)
 
 

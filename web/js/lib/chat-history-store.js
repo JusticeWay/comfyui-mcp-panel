@@ -12,6 +12,7 @@ export const CHAT_HISTORY_STATE_KEY = "state";
 
 const DEFAULT_THREADS_KEY = "comfyui-mcp.panel.threads";
 const DEFAULT_META_KEY = "comfyui-mcp.panel.historyMeta";
+const DEFAULT_SERVER_URL = "/comfyui_mcp_panel/chat_history";
 const LOCAL_SHADOW_THREADS = 20;
 const LOCAL_SHADOW_MESSAGES = 200;
 
@@ -251,9 +252,13 @@ export class ChatHistoryStore {
   constructor(options = {}) {
     this.storage = options.storage ?? globalThis.localStorage;
     this.indexedDb = options.indexedDb ?? globalThis.indexedDB;
+    this.fetchImpl = options.fetchImpl ?? globalThis.fetch?.bind(globalThis);
     this.threadsKey = options.threadsKey ?? DEFAULT_THREADS_KEY;
     this.metaKey = options.metaKey ?? DEFAULT_META_KEY;
+    this.serverUrl = options.serverUrl ?? DEFAULT_SERVER_URL;
+    this.serverEnabled = options.serverEnabled ?? (() => false);
     this._writePromise = Promise.resolve(null);
+    this._serverTimer = null;
     this._lastCommitted = null;
   }
 
@@ -267,17 +272,32 @@ export class ChatHistoryStore {
     }
   }
 
+  async readServer() {
+    if (!this.serverEnabled() || !this.fetchImpl) return null;
+    try {
+      const res = await this.fetchImpl(this.serverUrl, {
+        method: "GET",
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+      if (!res.ok) return null;
+      return parseHistoryImport(await res.json());
+    } catch {
+      return null;
+    }
+  }
+
   async load() {
     const local = this.readLocal();
-    const indexed = await idbRead(this.indexedDb);
-    const merged = mergeHistorySnapshots(local, indexed);
+    const [indexed, server] = await Promise.all([idbRead(this.indexedDb), this.readServer()]);
+    const merged = mergeHistorySnapshots(local, indexed, server);
     // Migration is automatic: once loaded, the full merged set is promoted to
     // IndexedDB while a small legacy shadow remains for older panel builds.
-    this.persist(merged.threads, merged.meta);
+    this.persist(merged.threads, merged.meta, { server: false });
     return merged;
   }
 
-  persist(threads, meta = {}) {
+  persist(threads, meta = {}, options = {}) {
     const snapshot = mergeHistorySnapshots({ threads, meta });
     try {
       const shadow = snapshot.threads
@@ -298,6 +318,13 @@ export class ChatHistoryStore {
         if (merged) this._lastCommitted = merged;
         return merged;
       });
+    if (options.server !== false && this.serverEnabled()) {
+      clearTimeout(this._serverTimer);
+      this._serverTimer = setTimeout(async () => {
+        await this.flush();
+        await this.writeServer(mergeHistorySnapshots(snapshot, this._lastCommitted));
+      }, 700);
+    }
     return snapshot;
   }
 
@@ -317,6 +344,21 @@ export class ChatHistoryStore {
   async flush() {
     await this._writePromise.catch(() => null);
     return true;
+  }
+
+  async writeServer(snapshot) {
+    if (!this.serverEnabled() || !this.fetchImpl) return false;
+    try {
+      const res = await this.fetchImpl(this.serverUrl, {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(snapshot),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
   }
 
   exportPayload(threads, meta = {}) {

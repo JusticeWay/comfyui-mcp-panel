@@ -5,7 +5,7 @@ This pack ships **no Python nodes**. It does two things:
 1. Serve the sidebar panel JS (``web/js/comfyui-mcp-panel.js``) to the ComfyUI
    frontend via ``WEB_DIRECTORY``.
 
-2. Expose a tiny **read-only** local API the panel uses to discover whether the
+2. Expose a tiny local API the panel uses to discover whether the
    panel **orchestrator** is already running, which provider/backend is ready,
    and the ComfyUI URL to target — so the sidebar can show the right onboarding
    state and the exact one-command start line.
@@ -32,9 +32,12 @@ Env knobs:
 - ``COMFYUI_URL`` — the ComfyUI the agent targets (auto-detected otherwise).
 """
 
+import json
+import math
 import os
 import shutil
 import sys
+import threading
 
 # Bare-name imports on purpose. The registry's static scanner is a plain-text
 # matcher, so it flags the dotted module-attribute spellings of these two APIs —
@@ -322,11 +325,175 @@ def _start_hint(port, comfyui_url=None):
 
 
 # ---------------------------------------------------------------------------
-# Local API the panel calls. Read-only / advisory: it reports orchestrator and
-# provider state and, when nothing is running, returns the command to start it.
-# It never spawns or kills a process (Comfy Registry security standards) — see
-# the module docstring.
+# Local API the panel calls. Most routes are read-only/advisory. The opt-in chat
+# history route writes one bounded JSON backup beneath ComfyUI's user directory.
+# It never spawns or kills a process (Comfy Registry security standards).
 # ---------------------------------------------------------------------------
+_CHAT_HISTORY_LIMIT = 25 * 1024 * 1024
+_CHAT_HISTORY_MAX_THREADS = 500
+_CHAT_HISTORY_MAX_MESSAGES = 5000
+_CHAT_HISTORY_LOCK = threading.Lock()
+
+
+def _chat_history_path():
+    """Per-install user-data path for the optional browser-history backup."""
+    try:
+        import folder_paths  # type: ignore
+
+        base = folder_paths.get_user_directory()
+    except Exception:
+        base = os.path.join(os.path.dirname(__file__), ".data")
+    return os.path.join(base, "comfyui-mcp-panel", "chat-history.json")
+
+
+def _validate_chat_history(payload):
+    """Return compact JSON bytes or raise ValueError for malformed/huge input."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("threads"), list):
+        raise ValueError("history must be an object with a threads array")
+    if payload.get("schemaVersion", 2) != 2:
+        raise ValueError("unsupported history schema version")
+    if not isinstance(payload.get("meta", {}), dict):
+        raise ValueError("history meta must be an object")
+    if len(payload["threads"]) > _CHAT_HISTORY_MAX_THREADS:
+        raise ValueError("history contains too many threads")
+    seen_ids = set()
+    for thread in payload["threads"]:
+        if not isinstance(thread, dict):
+            raise ValueError("every history thread must be an object")
+        thread_id = thread.get("id")
+        if not isinstance(thread_id, str) or not thread_id or len(thread_id) > 200:
+            raise ValueError("every history thread needs a bounded string id")
+        if thread_id in seen_ids:
+            raise ValueError("history contains duplicate thread ids")
+        seen_ids.add(thread_id)
+        messages = thread.get("msgs", [])
+        if not isinstance(messages, list) or len(messages) > _CHAT_HISTORY_MAX_MESSAGES:
+            raise ValueError("history thread contains too many messages")
+        if any(not isinstance(message, dict) for message in messages):
+            raise ValueError("every history message must be an object")
+        for field, limit in (("workflowKey", 512), ("workflowTitle", 240), ("title", 160)):
+            value = thread.get(field)
+            if value is not None and (not isinstance(value, str) or len(value) > limit):
+                raise ValueError("history thread {} is invalid".format(field))
+    deleted = payload.get("meta", {}).get("deletedThreads", {})
+    if not isinstance(deleted, dict) or len(deleted) > _CHAT_HISTORY_MAX_THREADS * 10:
+        raise ValueError("history tombstones are invalid")
+    for thread_id, timestamp in deleted.items():
+        if not isinstance(thread_id, str) or not thread_id or len(thread_id) > 200:
+            raise ValueError("history tombstone id is invalid")
+        if not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp):
+            raise ValueError("history tombstone timestamp is invalid")
+    try:
+        raw = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("history contains non-JSON data") from exc
+    if len(raw) > _CHAT_HISTORY_LIMIT:
+        raise ValueError("history exceeds the 25 MB backup limit")
+    return raw
+
+
+async def _read_bounded_json(request):
+    """Read at most the backup limit before parsing; never buffer an unbounded body."""
+    if request.content_length is not None and request.content_length > _CHAT_HISTORY_LIMIT:
+        raise ValueError("history exceeds the 25 MB backup limit")
+    chunks = []
+    size = 0
+    async for chunk in request.content.iter_chunked(64 * 1024):
+        size += len(chunk)
+        if size > _CHAT_HISTORY_LIMIT:
+            raise ValueError("history exceeds the 25 MB backup limit")
+        chunks.append(chunk)
+    try:
+        return json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("history body must be valid UTF-8 JSON") from exc
+
+
+def _history_ts(value):
+    try:
+        number = float(value)
+        return number if number > 0 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _merge_chat_history(existing, incoming):
+    """Merge append-only chat snapshots without dropping another writer.
+
+    Thread metadata follows the newest revision, identified messages are
+    unioned, and deletion tombstones suppress stale copies. The same semantics
+    are used by the browser store so multi-tab and server backup agree.
+    """
+    existing = existing if isinstance(existing, dict) else {}
+    incoming = incoming if isinstance(incoming, dict) else {}
+    old_meta = existing.get("meta") if isinstance(existing.get("meta"), dict) else {}
+    new_meta = incoming.get("meta") if isinstance(incoming.get("meta"), dict) else {}
+    deleted = {}
+    for source in (old_meta.get("deletedThreads"), new_meta.get("deletedThreads")):
+        if not isinstance(source, dict):
+            continue
+        for thread_id, timestamp in source.items():
+            deleted[str(thread_id)] = max(deleted.get(str(thread_id), 0), _history_ts(timestamp))
+
+    meta = {**old_meta, **new_meta}
+    for field in ("activeByScope", "workflowAliases"):
+        old_values = old_meta.get(field) if isinstance(old_meta.get(field), dict) else {}
+        new_values = new_meta.get(field) if isinstance(new_meta.get(field), dict) else {}
+        meta[field] = {**old_values, **new_values}
+    meta["deletedThreads"] = deleted
+
+    by_id = {}
+    for payload in (existing, incoming):
+        for candidate in payload.get("threads", []) if isinstance(payload.get("threads"), list) else []:
+            if not isinstance(candidate, dict) or not isinstance(candidate.get("id"), str):
+                continue
+            thread_id = candidate["id"]
+            previous = by_id.get(thread_id)
+            if previous is None:
+                by_id[thread_id] = candidate
+                continue
+            previous_ts = _history_ts(previous.get("updatedAt", previous.get("ts")))
+            candidate_ts = _history_ts(candidate.get("updatedAt", candidate.get("ts")))
+            older, newer = (previous, candidate) if candidate_ts >= previous_ts else (candidate, previous)
+            old_messages = older.get("msgs") if isinstance(older.get("msgs"), list) else []
+            new_messages = newer.get("msgs") if isinstance(newer.get("msgs"), list) else []
+            identified = all(
+                isinstance(message, dict) and isinstance(message.get("id"), str) and message["id"]
+                for message in old_messages + new_messages
+            )
+            messages = new_messages
+            if identified:
+                by_message_id = {message["id"]: message for message in old_messages}
+                by_message_id.update({message["id"]: message for message in new_messages})
+                messages = sorted(
+                    by_message_id.values(),
+                    key=lambda message: _history_ts(message.get("createdAt", message.get("ts"))),
+                )
+            by_id[thread_id] = {**older, **newer, "msgs": messages}
+
+    threads = [
+        thread
+        for thread in by_id.values()
+        if deleted.get(thread["id"], 0) < _history_ts(thread.get("updatedAt", thread.get("ts")))
+    ]
+    threads.sort(key=lambda thread: _history_ts(thread.get("updatedAt", thread.get("ts"))))
+    updated_at = max(
+        [_history_ts(existing.get("updatedAt")), _history_ts(incoming.get("updatedAt"))]
+        + [_history_ts(thread.get("updatedAt", thread.get("ts"))) for thread in threads]
+    )
+    return {
+        "schemaVersion": 2,
+        "updatedAt": updated_at,
+        "threads": threads,
+        "meta": meta,
+    }
+
+
 def _register_routes():
     try:
         from server import PromptServer  # type: ignore
@@ -337,6 +504,62 @@ def _register_routes():
         return
 
     routes = PromptServer.instance.routes
+
+    @routes.get("/comfyui_mcp_panel/chat_history")
+    async def _chat_history_get(_request):
+        path = _chat_history_path()
+        try:
+            with _CHAT_HISTORY_LOCK, open(path, "rb") as handle:
+                raw = handle.read(_CHAT_HISTORY_LIMIT + 1)
+            if len(raw) > _CHAT_HISTORY_LIMIT:
+                return web.json_response({"error": "stored history is too large"}, status=500)
+            payload = json.loads(raw.decode("utf-8"))
+            _validate_chat_history(payload)
+        except FileNotFoundError:
+            payload = {"schemaVersion": 2, "threads": [], "meta": {}}
+        except Exception as exc:
+            _log("chat history backup could not be read: {}".format(exc))
+            return web.json_response({"error": "history backup is unreadable"}, status=500)
+        return web.json_response(payload, headers={"Cache-Control": "no-store"})
+
+    @routes.put("/comfyui_mcp_panel/chat_history")
+    async def _chat_history_put(request):
+        try:
+            payload = await _read_bounded_json(request)
+            raw = _validate_chat_history(payload)
+        except Exception as exc:
+            status = 413 if "25 MB" in str(exc) else 400
+            return web.json_response({"ok": False, "message": str(exc)}, status=status)
+        path = _chat_history_path()
+        directory = os.path.dirname(path)
+        tmp = path + ".tmp"
+        try:
+            with _CHAT_HISTORY_LOCK:
+                try:
+                    with open(path, "rb") as handle:
+                        stored_raw = handle.read(_CHAT_HISTORY_LIMIT + 1)
+                    if len(stored_raw) > _CHAT_HISTORY_LIMIT:
+                        raise ValueError("stored history is too large")
+                    stored = json.loads(stored_raw.decode("utf-8"))
+                except FileNotFoundError:
+                    stored = {"schemaVersion": 2, "threads": [], "meta": {}}
+                payload = _merge_chat_history(stored, payload)
+                raw = _validate_chat_history(payload)
+                os.makedirs(directory, exist_ok=True)
+                with open(tmp, "wb") as handle:
+                    handle.write(raw)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, path)
+        except Exception as exc:
+            try:
+                if os.path.isfile(tmp):
+                    os.unlink(tmp)
+            except Exception:
+                pass
+            _log("chat history backup could not be written: {}".format(exc))
+            return web.json_response({"ok": False, "message": "backup write failed"}, status=500)
+        return web.json_response({"ok": True, "bytes": len(raw)})
 
     # Same-origin CivitAI proxy for the browser CivitAI modal (bot-gate headers +
     # OAuth live server-side; the browser never sees CivitAI tokens).
@@ -511,7 +734,7 @@ def _register_routes():
             status=503,
         )
 
-    _log("agent panel routes registered (read-only; orchestrator runs out-of-band)")
+    _log("agent panel routes registered (orchestrator runs out-of-band)")
 
 
 _register_routes()

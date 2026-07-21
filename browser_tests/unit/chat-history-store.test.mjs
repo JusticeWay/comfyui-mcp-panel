@@ -152,3 +152,31 @@ test('notifies another tab when the local history shadow changes', () => {
   unsubscribe()
   assert.equal(listeners.size, 0)
 })
+
+test('server backup is opt-in and uses same-origin GET/PUT only when enabled', async () => {
+  const calls = []
+  const fetchImpl = async (_url, options = {}) => {
+    calls.push(options)
+    return {
+      ok: true,
+      async json() {
+        return { schemaVersion: 2, threads: [{ id: 'remote', ts: 1, msgs: [] }], meta: {} }
+      }
+    }
+  }
+  const disabled = new ChatHistoryStore({ indexedDb: null, storage: null, fetchImpl })
+  assert.equal(await disabled.readServer(), null)
+  assert.equal(calls.length, 0)
+
+  const enabled = new ChatHistoryStore({
+    indexedDb: null,
+    storage: null,
+    fetchImpl,
+    serverEnabled: () => true
+  })
+  assert.equal((await enabled.readServer()).threads[0].id, 'remote')
+  assert.equal(await enabled.writeServer({ schemaVersion: 2, threads: [], meta: {} }), true)
+  assert.deepEqual(calls.map((call) => call.method), ['GET', 'PUT'])
+  assert.equal(calls[0].credentials, 'same-origin')
+  assert.equal(calls[1].credentials, 'same-origin')
+})
