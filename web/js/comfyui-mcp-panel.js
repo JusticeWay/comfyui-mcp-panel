@@ -67,6 +67,12 @@ import DOMPurify from "./vendor/purify.es.js";
 import qrcodegen from "./vendor/qrcode.esm.js";
 import { computeLayout } from "./lib/layout-engine.js";
 import {
+  ChatHistoryStore,
+  mergeHistorySnapshots,
+  selectPanelThread,
+  selectThreadForScope,
+} from "./lib/chat-history-store.js";
+import {
   isThreadInScope,
   normalizedWorkflowPath,
   shouldForkEmbeddedWorkflowUuid,
@@ -10033,31 +10039,48 @@ function buildPanel() {
 
   // ---- feed renderers + thread persistence ----
   // paint* draws DOM only; append* paints AND records into the current
-  // thread (localStorage), so history can replay a conversation verbatim.
+  // thread. IndexedDB is canonical; localStorage remains a small synchronous
+  // startup shadow and migration source for pre-v2 panel builds.
   const THREADS_KEY = "comfyui-mcp.panel.threads";
-  const MAX_THREADS = 20;
-  const MAX_THREAD_MSGS = 200;
-  let threads = (() => {
-    try {
-      const t = JSON.parse(window.localStorage.getItem(THREADS_KEY) ?? "[]");
-      return Array.isArray(t) ? t : [];
-    } catch {
-      return [];
-    }
-  })();
+  const MAX_THREADS = 500;
+  const MAX_THREAD_MSGS = 5000;
+  const historyStore = new ChatHistoryStore({ threadsKey: THREADS_KEY });
+  const localHistory = historyStore.readLocal();
+  let threads = localHistory.threads;
+  let historyMeta = localHistory.meta;
   let thread = null; // created lazily on first recorded message
 
   function currentTranscriptScopeKey({ embed = false } = {}) {
     return sessionFollowsPanel() ? workflowTabId() : workflowStorageKey({ embed });
   }
 
-  function persistThreads() {
-    try {
-      window.localStorage.setItem(THREADS_KEY, JSON.stringify(threads.slice(-MAX_THREADS)));
-    } catch {
-      // localStorage unavailable — history is session-only.
-    }
+  function currentHistorySelectionKey({ embed = false } = {}) {
+    return sessionFollowsPanel() ? "panel:global" : workflowStorageKey({ embed });
   }
+
+  function setActiveThread(scopeKey, threadId) {
+    historyMeta.activeByScope = historyMeta.activeByScope || {};
+    if (threadId) historyMeta.activeByScope[scopeKey] = threadId;
+    else delete historyMeta.activeByScope[scopeKey];
+  }
+
+  function persistThreads() {
+    historyMeta.workflowAliases = { ..._workflowUuidAliases };
+    historyStore.persist(threads.slice(-MAX_THREADS), historyMeta);
+  }
+
+  const unsubscribeHistorySync = historyStore.subscribe((incoming) => {
+    const currentThreadId = thread?.id;
+    const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, incoming);
+    threads = merged.threads.slice(-MAX_THREADS);
+    historyMeta = merged.meta;
+    if (currentThreadId) {
+      const refreshed = threads.find((candidate) => candidate.id === currentThreadId);
+      if (refreshed && isThreadInScope(refreshed, currentTranscriptScopeKey())) thread = refreshed;
+      else if (historyMeta.deletedThreads?.[currentThreadId]) newChat();
+    }
+    if (!histPop.hidden) renderHistory();
+  });
 
   // Find the (single) thread bound to an exact transcript scope. Old path-keyed
   // records are adopted only when their path exactly matches the open workflow;
@@ -10072,10 +10095,7 @@ function buildPanel() {
         persistThreads();
       }
     }
-    for (let i = threads.length - 1; i >= 0; i--) {
-      if (threads[i].workflowKey === wfid) return threads[i];
-    }
-    return null;
+    return selectThreadForScope(threads, historyMeta, wfid);
   }
 
   function record(entry) {
@@ -10088,20 +10108,38 @@ function buildPanel() {
       ssSet(CURRENT_THREAD_KEY, null);
     }
     if (!thread) {
-      thread = { id: crypto.randomUUID(), ts: Date.now(), msgs: [], workflowKey: scopeKey };
+      const now = Date.now();
+      thread = {
+        id: crypto.randomUUID(),
+        schemaVersion: 2,
+        createdAt: now,
+        updatedAt: now,
+        ts: now,
+        msgs: [],
+        workflowKey: scopeKey,
+      };
       // Adopt any session id the orchestrator has already reported for this tab.
       const sid = ssGet(SESSION_KEY);
       if (sid) thread.sessionId = sid;
       threads.push(thread);
       if (threads.length > MAX_THREADS) threads = threads.slice(-MAX_THREADS);
       ssSet(CURRENT_THREAD_KEY, thread.id);
+      setActiveThread(currentHistorySelectionKey(), thread.id);
     }
+    const now = Date.now();
+    entry = {
+      ...entry,
+      id: typeof entry.id === "string" && entry.id ? entry.id : crypto.randomUUID(),
+      createdAt: Number(entry.createdAt) || now,
+    };
     thread.msgs.push(entry);
     if (thread.msgs.length > MAX_THREAD_MSGS) {
       thread.msgs.splice(0, thread.msgs.length - MAX_THREAD_MSGS);
     }
-    thread.ts = Date.now();
+    thread.updatedAt = now;
+    thread.ts = now;
     persistThreads();
+    return entry;
   }
 
   /** Bind the agent's current session id to the open thread (for reload/resume). */
@@ -11045,6 +11083,7 @@ function buildPanel() {
   }
 
   function newChat() {
+    setActiveThread(currentHistorySelectionKey(), null);
     thread = null;
     turnAnchors = []; // fresh conversation → no rewind anchors
     ssSet(CURRENT_THREAD_KEY, null);
@@ -11054,6 +11093,7 @@ function buildPanel() {
     resetFeed();
     renderTodo([]); // fresh chat → empty plan tray
     setContextPct(0);
+    persistThreads();
     ctxLabel.textContent = "—";
     // Tell the orchestrator to forget this tab's session so the NEXT message
     // starts a genuinely fresh agent (no memory of the prior conversation).
@@ -11067,6 +11107,8 @@ function buildPanel() {
     }
     thread = t;
     ssSet(CURRENT_THREAD_KEY, t.id);
+    setActiveThread(currentHistorySelectionKey(), t.id);
+    persistThreads();
     resetFeed();
     for (const m of t.msgs) {
       if (m.role === "user") paintUser(m.text, { attachments: m.attachments });
@@ -11124,7 +11166,9 @@ function buildPanel() {
       if (wfid.startsWith("wf:") && wf && (wf.key || wf.id)) _tempWorkflowIds.delete(wf.key || wf.id);
       if (thread) {
         thread.workflowKey = wfid; // thread rides along for archive provenance
-        thread.ts = Date.now();
+        thread.updatedAt = Date.now();
+        thread.ts = thread.updatedAt;
+        setActiveThread("panel:global", thread.id);
         persistThreads();
       }
       currentWorkflowId = wfid;
@@ -11271,7 +11315,12 @@ function buildPanel() {
       del.appendChild(di);
       del.addEventListener("click", (ev) => {
         ev.stopPropagation();
+        historyMeta.deletedThreads = historyMeta.deletedThreads || {};
+        historyMeta.deletedThreads[t.id] = Date.now();
         threads = threads.filter((x) => x.id !== t.id);
+        for (const [key, value] of Object.entries(historyMeta.activeByScope || {})) {
+          if (value === t.id) delete historyMeta.activeByScope[key];
+        }
         persistThreads();
         // Deleting the open chat clears the feed and starts fresh.
         if (thread && thread.id === t.id) newChat();
@@ -14451,6 +14500,7 @@ function buildPanel() {
   // gets stranded as an empty cursor bubble; when it returns, resume the typewriters.
   function onVisibilityChange() {
     if (document.hidden) {
+      void historyStore.flush();
       for (const s of [...streamBubbles.values()]) {
         if (s.commitText != null) finalizeStream(s);
       }
@@ -14462,6 +14512,8 @@ function buildPanel() {
     }
   }
   document.addEventListener("visibilitychange", onVisibilityChange);
+  const onPageHide = () => { void historyStore.flush(); };
+  window.addEventListener("pagehide", onPageHide);
 
   // Reload restore: repaint the chat this tab was last showing. The agent's
   // memory continues automatically — either the orchestrator's agent for this
@@ -14472,12 +14524,16 @@ function buildPanel() {
       const cur = ssGet(CURRENT_THREAD_KEY);
       const pointed = cur ? threads.find((x) => x.id === cur) : null;
       if (sessionFollowsPanel()) {
-        // Main/default behavior: restore the pointed chat exactly as stored.
-        // Settings may not be hydrated yet, so this path must never rewrite keys.
-        if (!pointed || !pointed.msgs?.length) return;
-        thread = pointed;
+        // Recover from a lost tab pointer using durable metadata/newest fallback.
+        // Settings may not be hydrated yet, so never rewrite the thread's key.
+        const panelThread = pointed || selectPanelThread(threads, historyMeta);
+        if (!panelThread || !panelThread.msgs?.length) return;
+        thread = panelThread;
+        ssSet(CURRENT_THREAD_KEY, panelThread.id);
+        ssSet(SESSION_KEY, panelThread.sessionId || null);
+        setActiveThread("panel:global", panelThread.id);
         resetFeed();
-        for (const m of pointed.msgs) {
+        for (const m of panelThread.msgs) {
           if (m.role === "user") paintUser(m.text, { attachments: m.attachments });
           else if (m.role === "agent") paintAgent(m.text);
           else if (m.role === "card") {
@@ -14485,7 +14541,7 @@ function buildPanel() {
             else paintCard(m);
           }
         }
-        renderTodo(pointed.todos || []);
+        renderTodo(panelThread.todos || []);
         return;
       }
       const scopeKey = workflowStorageKey();
@@ -14495,6 +14551,7 @@ function buildPanel() {
       thread = t;
       ssSet(CURRENT_THREAD_KEY, t.id);
       ssSet(SESSION_KEY, t.sessionId || null);
+      setActiveThread(t.workflowKey, t.id);
       resetFeed();
       for (const m of t.msgs) {
         if (m.role === "user") paintUser(m.text, { attachments: m.attachments });
@@ -14509,6 +14566,25 @@ function buildPanel() {
       // Corrupt/absent state — start clean.
     }
   })();
+
+  // Paint the localStorage shadow immediately, then hydrate the canonical
+  // IndexedDB snapshot in the background and promote any legacy records.
+  void historyStore.load().then((loaded) => {
+    const merged = mergeHistorySnapshots({ threads, meta: historyMeta }, loaded);
+    threads = merged.threads.slice(-MAX_THREADS);
+    historyMeta = merged.meta;
+    if (historyMeta.workflowAliases && typeof historyMeta.workflowAliases === "object") {
+      _workflowUuidAliases = { ...historyMeta.workflowAliases, ..._workflowUuidAliases };
+      persistWorkflowAliases();
+    }
+    persistThreads();
+    const durableActive = sessionFollowsPanel()
+      ? selectPanelThread(threads, historyMeta)
+      : threadForWorkflow(currentTranscriptScopeKey());
+    if (durableActive && durableActive.id !== thread?.id) loadThread(durableActive);
+  }).catch(() => {
+    // localStorage shadow already painted; persistence degrades gracefully.
+  });
 
   // ---- Settings dialog → live panel hooks ----
   // Registered now that the runtime + connect functions exist. Each applier is
@@ -14661,6 +14737,8 @@ function buildPanel() {
       document.removeEventListener("mousedown", onDocPointerDown, true);
       document.removeEventListener("keydown", onInterruptKeydown, true);
       document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("pagehide", onPageHide);
+      unsubscribeHistorySync();
       try {
         api.removeEventListener("executed", onExecuted);
         api.removeEventListener("execution_success", onExecutionSuccess);
